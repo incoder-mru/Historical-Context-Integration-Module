@@ -1,13 +1,14 @@
 """
-This module generates synthetic temporal signed graphs using Erdős-Rényi random graph models
-and provides functionality to load, process, and visualize temporal graph datasets.
+This module generates synthetic temporal signed graphs using Watts-Strogatz and Barabási-Albert 
+graph models and provides functionality to load, process, and visualize temporal graph datasets.
 
 The primary purpose is to create realistic synthetic datasets that mimic the behavior of
 real-world signed networks (like Bitcoin trust networks) where edges have positive or
 negative signs and evolve over time through addition, removal, and sign changes.
 
 Key Components:
-- Erdős-Rényi temporal graph generation with configurable parameters
+- Watts-Strogatz temporal graph generation with small-world properties
+- Barabási-Albert temporal graph generation with preferential attachment
 - Temporal evolution modeling with edge persistence, sign flips, and network dynamics
 - Data loading and timestep splitting for both synthetic and real datasets
 - Visualization tools for analyzing temporal patterns in signed networks
@@ -19,8 +20,10 @@ import torch
 import gzip
 import matplotlib.pyplot as plt
 import networkx as nx
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List, Set
 from dataclasses import dataclass
+import random
+from collections import defaultdict
 
 # ============================================================================
 # DEVICE CONFIGURATION
@@ -58,395 +61,707 @@ class TemporalConfig:
         edge_death_prob: Probability that an existing edge is removed
         activity_variation: Controls temporal activity fluctuations (0=constant, 1=high variation)
     """
-    num_timesteps: int = 10
-    base_time: int = 1000000000  # Unix timestamp base
-    time_interval: int = 86400   # Seconds between timesteps (1 day)
-    edge_persistence: float = 0.4  # Probability edge survives to next timestep
-    sign_flip_prob: float = 0.02   # Probability of sign flip
-    new_edge_prob: float = 0.3     # Rate of new edges
-    edge_death_prob: float = 0.2   # Rate of edge removal
-    activity_variation: float = 0.5  # Activity variation (0=constant, 1=high variation)
+    num_timesteps: int = 20
+    base_time: int = 1000000000
+    time_interval: int = 86400
+    
+    edge_persistence: float = 0.4
+    sign_flip_prob: float = 0.02
+    new_edge_prob: float = 0.3
+    edge_death_prob: float = 0.2
+    activity_variation: float = 0.5
+    triadic_closure_prob: float = 0.15  # Probability of forming triangles
+    community_homophily: float = 0.7    # Preference for intra-community edges
+    sentiment_propagation: float = 0.1   # Rate of sentiment spread along edges
+    node_activity_correlation: float = 0.6  # How much node activity affects edge formation
+    degree_attachment_strength: float = 0.3  # Strength of preferential attachment
+    temporal_clustering_strength: float = 0.4  # Tendency for edges to cluster in time
 
 
 @dataclass
 class GraphConfig:
     """
-    Configuration parameters that define the structural properties of Erdős-Rényi graphs.
+    Configuration parameters that define the structural properties of graphs.
     
     These parameters control the initial graph topology and the distribution of
     positive versus negative edges, mimicking real-world signed network characteristics.
     
     Attributes:
         num_nodes: Total number of nodes (users/entities) in the network
-        er_prob: Edge probability for Erdős-Rényi model (controls network sparsity)
         positive_ratio: Fraction of edges that are positive (trust vs distrust)
+        
+        # WS-specific parameters
+        ws_k: Each node is initially connected to k nearest neighbors in ring topology
+        ws_p: Probability of rewiring each edge (0=regular, 1=random)
+        
+        # BA-specific parameters
+        ba_m: Number of edges to attach from new node in BA model
+        ba_seed_nodes: Initial connected nodes for BA model
+        
+        # Enhanced parameters
+        num_communities: Number of communities for enhanced dynamics
+        community_strength: How strongly nodes cluster in communities
     """
-    num_nodes: int = 100
-    er_prob: float = 0.005  # Edge probability (sparse like real networks)
-    positive_ratio: float = 0.85  # Ratio of positive to negative edges
-
-
-# ============================================================================
-# TEMPORAL GRAPH GENERATOR CLASS
-# ============================================================================
-
-class ERTemporalGraphGenerator:
-    """
-    Generator for temporal signed Erdős-Rényi graphs that evolve over time.
+    num_nodes: int = 2000
+    positive_ratio: float = 0.88
     
-    This class creates synthetic datasets that mimic real-world signed networks
-    by modeling how trust/distrust relationships form, persist, change, and dissolve
-    over time. The generator uses stochastic processes to simulate realistic
-    network dynamics including:
-    - Edge persistence (some relationships endure)
-    - Sign flipping (trust can become distrust and vice versa)
-    - Network growth and shrinkage (new connections form, old ones break)
-    - Activity variations (some periods are more active than others)
+    # WS-specific parameters
+    ws_k: int = 6  # Each node connected to k nearest neighbors
+    ws_p: float = 0.1  # Rewiring probability (0.1 creates small-world)
     
-    The resulting datasets are suitable for testing temporal graph neural networks
-    and link prediction algorithms on signed networks.
-    """
+    # BA-specific parameters
+    ba_m: int = 4  # Number of edges to attach from new node in BA model
+    ba_seed_nodes: int = 5  # Initial connected nodes for BA model
+    
+    # Enhanced parameters
+    num_communities: int = 5  # Number of communities for enhanced dynamics
+    community_strength: float = 0.8  # How strongly nodes cluster in communities
+    
+# ============================================================================
+# WATTS-STROGATZ TEMPORAL GRAPH GENERATOR CLASS
+# ============================================================================
+
+class WSTemporalGraphGenerator:
+    """Watts-Strogatz small-world network generator with rich temporal dynamics."""
     
     def __init__(self, graph_config: GraphConfig, temporal_config: TemporalConfig):
-        """
-        Initialize the generator with structural and temporal configuration parameters.
-        
-        Args:
-            graph_config: Parameters defining the graph structure and edge sign distribution
-            temporal_config: Parameters controlling temporal evolution dynamics
-        """
+        """Initialize the WS generator with configuration parameters."""
         self.graph_config = graph_config
         self.temporal_config = temporal_config
         
+        # Initialize community structure - assign nodes to communities in a ring-aware manner
+        # This respects the initial ring structure while adding community dynamics
+        nodes_per_community = self.graph_config.num_nodes // self.graph_config.num_communities
+        self.node_communities = []
+        
+        for i in range(self.graph_config.num_nodes):
+            # Assign communities in blocks to maintain some locality
+            community = (i // nodes_per_community) % self.graph_config.num_communities
+            self.node_communities.append(community)
+        
+        self.node_communities = np.array(self.node_communities)
+        self.node_activities = np.random.random(self.graph_config.num_nodes)
+        
+        # Track clustering coefficient for small-world maintenance
+        self.target_clustering = None
+    
     def generate_base_graph(self) -> nx.Graph:
-        """
-        Generate the initial Erdős-Rényi graph structure for timestep 0.
-        
-        Creates a random graph where each possible edge exists with probability er_prob.
-        This forms the foundation topology that will evolve over subsequent timesteps.
-        The Erdős-Rényi model produces realistic sparse networks similar to real-world
-        social and trust networks.
-        
-        Returns:
-            NetworkX Graph object representing the initial network topology
-        """
-        return nx.erdos_renyi_graph(
-            self.graph_config.num_nodes, 
-            self.graph_config.er_prob
+        """Generate initial WS small-world graph."""
+        # Use NetworkX's built-in Watts-Strogatz generator
+        G = nx.watts_strogatz_graph(
+            n=self.graph_config.num_nodes,
+            k=self.graph_config.ws_k,
+            p=self.graph_config.ws_p,
+            seed=None
         )
+        
+        # Store the target clustering coefficient to maintain small-world properties
+        self.target_clustering = nx.average_clustering(G)
+        print(f"Initial WS graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+        print(f"Clustering coefficient: {self.target_clustering:.3f}")
+        print(f"Average path length: {nx.average_shortest_path_length(G):.3f}")
+        
+        return G
     
     def assign_edge_signs(self, G: nx.Graph) -> Dict[Tuple[int, int], int]:
-        """
-        Assign positive (+1) or negative (-1) signs to all edges in the graph.
-        
-        Signs represent the nature of relationships: positive edges indicate trust,
-        friendship, or positive sentiment, while negative edges represent distrust,
-        antagonism, or negative sentiment. The distribution follows the configured
-        positive_ratio to mimic real networks where positive relationships typically
-        outnumber negative ones.
-        
-        Args:
-            G: NetworkX graph with edges needing sign assignment
-            
-        Returns:
-            Dictionary mapping edge tuples to their assigned signs {(u,v): sign}
-        """
+        """Assign edge signs with small-world and community-based bias."""
         edge_signs = {}
         
         for edge in G.edges():
-            # Randomly assign signs based on the configured positive/negative ratio
-            if np.random.random() < self.graph_config.positive_ratio:
-                sign = 1  # Positive edge (trust, friendship, positive sentiment)
+            i, j = edge
+            
+            # Enhanced positive bias to reduce negative edge ratio
+            base_positive_prob = self.graph_config.positive_ratio
+            
+            # Small-world networks: local edges (high clustering) tend to be more positive
+            # Check if this edge contributes to local clustering
+            common_neighbors = len(list(nx.common_neighbors(G, i, j)))
+            clustering_bonus = min(0.1, common_neighbors * 0.02)  # Bonus for clustered edges
+            
+            # Community homophily effect with stronger positive bias
+            if self.node_communities[i] == self.node_communities[j]:
+                community_bonus = 0.08  # Within-community positive bias
             else:
-                sign = -1  # Negative edge (distrust, antagonism, negative sentiment)
+                community_bonus = -0.03  # Small penalty for cross-community
+            
+            positive_prob = base_positive_prob + clustering_bonus + community_bonus
+            positive_prob = np.clip(positive_prob, 0.75, 0.96)  # Keep in reasonable bounds
+            
+            sign = 1 if np.random.random() < positive_prob else -1
             edge_signs[edge] = sign
             
         return edge_signs
     
-    def evolve_graph(self, current_edges: Dict[Tuple[int, int], int], 
-                     timestep: int) -> Dict[Tuple[int, int], int]:
-        """
-        Evolve the graph structure and edge signs for the next timestep.
-        
-        This method implements the core temporal dynamics by modeling three key processes:
-        1. Edge persistence: Some existing edges survive with possible sign changes
-        2. Edge addition: New relationships form based on activity levels
-        3. Edge removal: Some existing relationships dissolve
-        
-        The evolution includes realistic temporal patterns like activity fluctuations
-        and periodic trends that create more dynamic and realistic synthetic data.
-        
-        Args:
-            current_edges: Dictionary of current edges and their signs
-            timestep: Current timestep index (used for temporal patterns)
-            
-        Returns:
-            Dictionary of edges and signs for the next timestep
-        """
+    def evolve_graph(self, current_edges: Dict[Tuple[int, int], int], timestep: int) -> Dict[Tuple[int, int], int]:
+        """Evolve WS graph while maintaining small-world properties."""
         new_edges = {}
         
-        # Model activity variation: some timesteps have higher/lower network activity
-        # This creates realistic temporal patterns where network usage fluctuates
-        activity_multiplier = 1.0 + (np.random.random() - 0.5) * 2 * self.temporal_config.activity_variation
-        activity_multiplier = max(0.2, min(2.0, activity_multiplier))  # Clamp to reasonable bounds
+        # Natural activity variation that can create ups and downs
+        base_activity = 1.0 + (np.random.random() - 0.5) * self.temporal_config.activity_variation * 0.6
+        activity_multiplier = np.clip(base_activity, 0.8, 1.25)
         
-        # PHASE 1: Edge Persistence and Sign Evolution
-        # Determine which existing edges survive to the next timestep
-        persistence_rate = self.temporal_config.edge_persistence * activity_multiplier
+        # PHASE 1: Edge Persistence with small-world bias
+        # Local edges (contributing to clustering) have higher persistence
+        persistence_rate = min(0.78, self.temporal_config.edge_persistence * 1.6 * activity_multiplier)
+        
         for edge, sign in current_edges.items():
-            if np.random.random() < persistence_rate:
-                # Edge survives - check if sign flips (trust→distrust or vice versa)
+            i, j = edge
+            
+            # Check if edge contributes to local clustering (has common neighbors)
+            current_edge_set = set(current_edges.keys())
+            i_neighbors = {n for (a, b) in current_edge_set for n in [a, b] if (a == i or b == i) and n != i}
+            j_neighbors = {n for (a, b) in current_edge_set for n in [a, b] if (a == j or b == j) and n != j}
+            common_neighbors = len(i_neighbors.intersection(j_neighbors))
+            
+            # Clustering edges persist longer to maintain small-world properties
+            clustering_bonus = min(0.15, common_neighbors * 0.03)
+            edge_persistence = min(0.9, persistence_rate + clustering_bonus)
+            
+            if np.random.random() < edge_persistence:
+                # Simple sign flip
                 if np.random.random() < self.temporal_config.sign_flip_prob:
-                    new_sign = -sign  # Flip sign (relationship polarity changes)
+                    new_sign = -sign
                 else:
-                    new_sign = sign  # Keep existing sign (relationship polarity stable)
+                    new_sign = sign
                 new_edges[edge] = new_sign
         
-        # PHASE 2: New Edge Formation
-        # Add new edges based on activity level and temporal patterns
+        # PHASE 2: New Edge Formation with small-world preference
         n = self.graph_config.num_nodes
-        base_edge_rate = 0.001  # Low base rate maintains realistic network sparsity
+        current_edge_count = len(current_edges)
         
-        # Apply temporal patterns: sinusoidal variation creates periodic activity cycles
-        time_factor = 1.0 + 0.5 * np.sin(timestep * 0.5)  # Periodic temporal patterns
-        target_new_edges = int(n * n * base_edge_rate * activity_multiplier * time_factor)
-        target_new_edges = max(1, min(target_new_edges, n * (n-1) // 4))  # Reasonable bounds
+        # Target to replace lost edges plus upward bias for recovery
+        edges_lost = current_edge_count - len(new_edges)
+        replacement_target = edges_lost + np.random.randint(-30, 150)  # Upward biased variation
+        target_new = max(50, int(replacement_target * activity_multiplier))  # Minimum new edges
+        target_new = min(target_new, n * 8)  # Higher cap
         
-        # Generate new edges through random sampling
+        # Strategy: Mix of random edges and triadic closure for small-world maintenance
         attempts = 0
-        max_attempts = target_new_edges * 3  # Prevent infinite loops
+        max_attempts = target_new * 4
+        new_edge_count = 0
+        triadic_attempts = int(target_new * 0.4)  # 40% of new edges try triadic closure
         
-        while len(new_edges) - len([e for e in new_edges if e in current_edges]) < target_new_edges and attempts < max_attempts:
-            # Randomly select two distinct nodes for potential edge
+        # First, attempt triadic closure to maintain clustering
+        triadic_added = 0
+        current_edge_set = set(new_edges.keys())
+        
+        for _ in range(triadic_attempts):
+            if triadic_added >= triadic_attempts:
+                break
+                
+            # Pick a random existing edge
+            if current_edge_set:
+                edge_list = list(current_edge_set)
+                random_edge = random.choice(edge_list)
+                i, j = random_edge
+                
+                # Find neighbors of both nodes
+                i_neighbors = {n for (a, b) in current_edge_set for n in [a, b] if (a == i or b == i) and n != i}
+                j_neighbors = {n for (a, b) in current_edge_set for n in [a, b] if (a == j or b == j) and n != j}
+                
+                # Try to close triangles
+                for neighbor in i_neighbors:
+                    if neighbor != j:
+                        potential_edge = tuple(sorted([j, neighbor]))
+                        if potential_edge not in current_edge_set and potential_edge not in new_edges:
+                            # Triadic closure with positive bias
+                            sign_i_neighbor = current_edges.get(tuple(sorted([i, neighbor])), 
+                                                             new_edges.get(tuple(sorted([i, neighbor])), 1))
+                            sign_i_j = current_edges.get(tuple(sorted([i, j])), 
+                                                       new_edges.get(tuple(sorted([i, j])), 1))
+                            
+                            # Structural balance: positive if both paths are same sign
+                            if sign_i_neighbor * sign_i_j > 0:
+                                triadic_sign = 1 if np.random.random() < 0.9 else -1
+                            else:
+                                triadic_sign = -1 if np.random.random() < 0.7 else 1
+                            
+                            new_edges[potential_edge] = triadic_sign
+                            current_edge_set.add(potential_edge)
+                            triadic_added += 1
+                            new_edge_count += 1
+                            break
+        
+        # Then add random edges for the remainder
+        while new_edge_count < target_new and attempts < max_attempts:
             i = np.random.randint(0, n)
             j = np.random.randint(0, n)
             
-            if i != j:  # Avoid self-loops
-                edge = tuple(sorted([i, j]))  # Canonical edge representation
+            if i != j:
+                edge = tuple(sorted([i, j]))
                 
                 if edge not in new_edges:
-                    # Assign sign to new edge based on configured ratio
-                    if np.random.random() < self.graph_config.positive_ratio:
-                        sign = 1   # New positive relationship
+                    # Small-world positive bias with community effects
+                    if self.node_communities[i] == self.node_communities[j]:
+                        positive_prob = min(0.95, self.graph_config.positive_ratio * 1.15)
                     else:
-                        sign = -1  # New negative relationship
+                        positive_prob = max(0.75, self.graph_config.positive_ratio * 0.95)
                     
+                    sign = 1 if np.random.random() < positive_prob else -1
                     new_edges[edge] = sign
+                    current_edge_set.add(edge)
+                    new_edge_count += 1
             
             attempts += 1
         
-        # PHASE 3: Edge Removal (Death)
-        # Remove some edges to model relationship dissolution
-        death_rate = self.temporal_config.edge_death_prob / activity_multiplier
+        # PHASE 3: Minimal Edge Removal to maintain small-world structure
+        additional_death_rate = 0.01  # Very low to preserve structure
         edges_to_remove = []
-        for edge in new_edges:
-            if np.random.random() < death_rate:
+        
+        # Preferentially remove edges that don't contribute to clustering
+        for edge in list(new_edges.keys()):
+            i, j = edge
+            
+            # Check clustering contribution
+            i_neighbors = {n for (a, b) in current_edge_set for n in [a, b] if (a == i or b == i) and n != i and n != j}
+            j_neighbors = {n for (a, b) in current_edge_set for n in [a, b] if (a == j or b == j) and n != j and n != i}
+            common_neighbors = len(i_neighbors.intersection(j_neighbors))
+            
+            # Edges with no common neighbors are more likely to be removed
+            if common_neighbors == 0 and np.random.random() < additional_death_rate * 2:
+                edges_to_remove.append(edge)
+            elif np.random.random() < additional_death_rate * 0.5:  # Very low rate for clustering edges
                 edges_to_remove.append(edge)
         
-        # Actually remove the selected edges
         for edge in edges_to_remove:
             del new_edges[edge]
         
         return new_edges
     
     def generate_temporal_dataset(self) -> pd.DataFrame:
-        """
-        Generate the complete temporal signed graph dataset across all timesteps.
-        
-        This method orchestrates the entire dataset generation process:
-        1. Creates the initial graph structure and assigns edge signs
-        2. Iteratively evolves the graph through all timesteps
-        3. Records all edges with their timestamps for downstream analysis
-        4. Provides progress feedback and summary statistics
-        
-        The resulting dataset contains all temporal edges suitable for training
-        and evaluating temporal graph neural networks and link prediction models.
-        
-        Returns:
-            Pandas DataFrame with columns: source, target, rating, time
-        """
-        print(f"Generating Erdős-Rényi temporal graph...")
+        """Generate the complete WS temporal dataset."""
+        print(f"Generating Watts-Strogatz small-world temporal graph...")
         print(f"Nodes: {self.graph_config.num_nodes}, Timesteps: {self.temporal_config.num_timesteps}")
+        print(f"WS parameters: k={self.graph_config.ws_k}, p={self.graph_config.ws_p}")
         
-        # Generate the initial graph structure and assign signs
+        # Generate initial WS graph
         base_graph = self.generate_base_graph()
         current_edges = self.assign_edge_signs(base_graph)
         
-        # Storage for all temporal edge data across timesteps
         all_data = []
         
-        # Generate data for each timestep in the temporal sequence
         for t in range(self.temporal_config.num_timesteps):
-            # Calculate timestamp for this timestep
             timestamp = (self.temporal_config.base_time + 
                         t * self.temporal_config.time_interval)
             
-            # Record all edges at this timestep
             for (source, target), rating in current_edges.items():
                 all_data.append({
-                    'source': source,      # Source node ID
-                    'target': target,      # Target node ID  
-                    'rating': rating,      # Edge sign (+1 or -1)
-                    'time': timestamp      # Unix timestamp
+                    'source': source,
+                    'target': target,
+                    'rating': rating,
+                    'time': timestamp
                 })
             
-            print(f"Timestep {t+1}: {len(current_edges)} edges")
+            # Print edge counts with positive/negative breakdown
+            pos_count = sum(1 for r in current_edges.values() if r == 1)
+            neg_count = sum(1 for r in current_edges.values() if r == -1)
+            print(f"Timestep {t+1}: {len(current_edges)} edges ({pos_count}+, {neg_count}-)")
             
-            # Evolve graph for next timestep (except for the final timestep)
             if t < self.temporal_config.num_timesteps - 1:
                 current_edges = self.evolve_graph(current_edges, t)
         
-        # Convert to DataFrame for easy manipulation and analysis
         df = pd.DataFrame(all_data)
         
-        # Print comprehensive dataset statistics
-        print(f"Generated dataset: {len(df)} total edges")
+        print(f"Generated WS dataset: {len(df)} total edges")
         print(f"Positive edges: {len(df[df['rating'] == 1])} ({len(df[df['rating'] == 1])/len(df)*100:.1f}%)")
         print(f"Negative edges: {len(df[df['rating'] == -1])} ({len(df[df['rating'] == -1])/len(df)*100:.1f}%)")
         
         return df
     
     def save_dataset(self, df: pd.DataFrame, filename: str, compress: bool = True):
-        """
-        Save the generated dataset to disk in CSV format.
-        
-        Supports optional gzip compression to reduce file size for large datasets.
-        The CSV format ensures compatibility with various analysis tools and frameworks.
-        Headers are omitted to match the expected format for downstream processing.
-        
-        Args:
-            df: DataFrame containing the temporal graph data
-            filename: Output filename (will add .gz if compression enabled)
-            compress: Whether to apply gzip compression to reduce file size
-        """
-        # Automatically add compression extension if not present
+        """Save the generated dataset to disk in CSV format."""
         if compress and not filename.endswith('.gz'):
             filename += '.gz'
         
-        # Save with appropriate compression
         if filename.endswith('.gz'):
             with gzip.open(filename, 'wt') as f:
-                df.to_csv(f, index=False, header=False)  # No headers for compatibility
+                df.to_csv(f, index=False, header=False)
         else:
             df.to_csv(filename, index=False, header=False)
         
         print(f"Saved dataset to: {filename}")
 
+# ============================================================================
+# BA TEMPORAL GRAPH GENERATOR CLASS
+# ============================================================================
+
+class BATemporalGraphGenerator:
+    """Barabási-Albert temporal graph generator with preferential attachment."""
+    
+    def __init__(self, graph_config: GraphConfig, temporal_config: TemporalConfig):
+        """Initialize BA generator with configuration parameters."""
+        self.graph_config = graph_config
+        self.temporal_config = temporal_config
+        
+        # Track node degrees for preferential attachment
+        self.positive_degrees = np.zeros(self.graph_config.num_nodes)
+        self.total_degrees = np.zeros(self.graph_config.num_nodes)
+        self.node_birth_time = np.full(self.graph_config.num_nodes, -1)
+        
+    def generate_base_graph(self) -> nx.Graph:
+        """Generate initial BA graph using preferential attachment."""
+        G = nx.Graph()
+        
+        # Start with small complete graph
+        seed_nodes = min(self.graph_config.ba_seed_nodes, self.graph_config.num_nodes)
+        for i in range(seed_nodes):
+            for j in range(i + 1, seed_nodes):
+                G.add_edge(i, j)
+            self.node_birth_time[i] = 0
+        
+        # Add remaining nodes with preferential attachment
+        for new_node in range(seed_nodes, self.graph_config.num_nodes):
+            # Calculate attachment probabilities based on current degrees
+            existing_nodes = list(G.nodes())
+            degrees = np.array([G.degree(node) for node in existing_nodes])
+            
+            if degrees.sum() > 0:
+                probabilities = degrees / degrees.sum()
+            else:
+                probabilities = np.ones(len(existing_nodes)) / len(existing_nodes)
+            
+            # Select m nodes to connect to
+            m = min(self.graph_config.ba_m, len(existing_nodes))
+            chosen_nodes = np.random.choice(
+                existing_nodes, 
+                size=m, 
+                replace=False, 
+                p=probabilities
+            )
+            
+            # Add edges to chosen nodes
+            for target in chosen_nodes:
+                G.add_edge(new_node, target)
+            
+            self.node_birth_time[new_node] = 0
+        
+        return G
+    
+    def assign_edge_signs(self, G: nx.Graph) -> Dict[Tuple[int, int], int]:
+        """Assign edge signs with preferential attachment bias."""
+        edge_signs = {}
+        
+        for edge in G.edges():
+            u, v = edge
+            
+            # BA networks: high-degree nodes tend to have more positive connections
+            degree_u = G.degree(u)
+            degree_v = G.degree(v)
+            avg_degree = (degree_u + degree_v) / 2
+            
+            # Higher degree nodes have higher positive probability
+            max_degree = max(dict(G.degree()).values()) if G.nodes() else 1
+            degree_factor = avg_degree / max_degree if max_degree > 0 else 0.5
+            
+            positive_prob = self.graph_config.positive_ratio + (degree_factor * 0.1)
+            positive_prob = min(0.95, positive_prob)
+            
+            sign = 1 if np.random.random() < positive_prob else -1
+            edge_signs[edge] = sign
+            
+            # Update degree tracking
+            if sign > 0:
+                self.positive_degrees[u] += 1
+                self.positive_degrees[v] += 1
+            
+            self.total_degrees[u] += 1
+            self.total_degrees[v] += 1
+        
+        return edge_signs
+    
+    def _preferential_attachment_probabilities(self, current_edges: Dict[Tuple[int, int], int], 
+                                             use_positive: bool = True) -> np.ndarray:
+        """Calculate preferential attachment probabilities."""
+        if use_positive:
+            degrees = self.positive_degrees.copy()
+        else:
+            degrees = self.total_degrees.copy()
+        
+        # Add small constant to avoid zero probabilities
+        degrees = degrees + 1
+        
+        # Normalize to probabilities
+        return degrees / degrees.sum()
+    
+    def evolve_graph(self, current_edges: Dict[Tuple[int, int], int], timestep: int) -> Dict[Tuple[int, int], int]:
+        """Evolve BA graph with preferential attachment dynamics."""
+        new_edges = {}
+        
+        # Reset degree counts
+        self.positive_degrees.fill(0)
+        self.total_degrees.fill(0)
+        
+        # Natural activity variation around 1.0
+        activity_multiplier = 1.0 + (np.random.random() - 0.5) * self.temporal_config.activity_variation * 0.3
+        activity_multiplier = max(0.9, min(1.1, activity_multiplier))
+        
+        # PHASE 1: Balanced Edge Persistence for BA networks
+        enhanced_persistence = min(0.8, self.temporal_config.edge_persistence * 1.6)
+        persistence_rate = enhanced_persistence * activity_multiplier
+        
+        for edge, sign in current_edges.items():
+            if np.random.random() < persistence_rate:
+                # Sign flip probability (lower in BA networks)
+                if np.random.random() < self.temporal_config.sign_flip_prob * 0.8:
+                    new_sign = -sign
+                else:
+                    new_sign = sign
+                    
+                new_edges[edge] = new_sign
+                
+                # Update degree counts
+                u, v = edge
+                if new_sign > 0:
+                    self.positive_degrees[u] += 1
+                    self.positive_degrees[v] += 1
+                self.total_degrees[u] += 1
+                self.total_degrees[v] += 1
+        
+        # PHASE 2: Controlled New Edge Formation for BA
+        n = self.graph_config.num_nodes
+        current_edge_count = len(current_edges)
+        
+        # Target to replace lost edges plus controlled variation
+        edges_lost = current_edge_count - len(new_edges)
+        replacement_target = edges_lost + np.random.randint(-30, 80)  # Controlled variation
+        target_new = max(0, int(replacement_target * activity_multiplier))
+        target_new = min(target_new, n * 8)  # Higher cap for BA due to preferential attachment
+        
+        attempts = 0
+        max_attempts = target_new * 5
+        new_edge_count = 0
+        
+        while new_edge_count < target_new and attempts < max_attempts:
+            # Simplified preferential attachment
+            if np.sum(self.total_degrees) > 0:
+                # Use degree-based selection
+                prob_total = (self.total_degrees + 1) / np.sum(self.total_degrees + 1)
+                i = np.random.choice(n, p=prob_total)
+                j = np.random.choice(n, p=prob_total)
+            else:
+                # Fallback to random selection
+                i = np.random.randint(0, n)
+                j = np.random.randint(0, n)
+            
+            if i != j:
+                edge = tuple(sorted([i, j]))
+                
+                if edge not in new_edges:
+                    # BA networks: preferential attachment increases positive probability
+                    degree_i = self.positive_degrees[i] + 1
+                    degree_j = self.positive_degrees[j] + 1
+                    degree_factor = min(1.0, (degree_i + degree_j) / 20.0)  # Normalize degree effect
+                    
+                    positive_prob = self.graph_config.positive_ratio + (degree_factor * 0.1)
+                    positive_prob = min(0.95, positive_prob)
+                    
+                    sign = 1 if np.random.random() < positive_prob else -1
+                    new_edges[edge] = sign
+                    new_edge_count += 1
+                    
+                    # Update degree counts
+                    if sign > 0:
+                        self.positive_degrees[i] += 1
+                        self.positive_degrees[j] += 1
+                    self.total_degrees[i] += 1
+                    self.total_degrees[j] += 1
+            
+            attempts += 1
+        
+        # PHASE 3: Minimal Additional Edge Removal for BA networks
+        additional_death_rate = 0.01  # Very minimal for BA networks
+        edges_to_remove = []
+        
+        for edge in list(new_edges.keys()):
+            u, v = edge
+            # Higher degree nodes protected from removal
+            avg_degree = (self.total_degrees[u] + self.total_degrees[v]) / 2
+            if avg_degree < 3 and np.random.random() < additional_death_rate:  # Only remove low-degree edges
+                edges_to_remove.append(edge)
+        
+        for edge in edges_to_remove:
+            u, v = edge
+            sign = new_edges[edge]
+            
+            # Update degree counts when removing edges
+            if sign > 0:
+                self.positive_degrees[u] = max(0, self.positive_degrees[u] - 1)
+                self.positive_degrees[v] = max(0, self.positive_degrees[v] - 1)
+            self.total_degrees[u] = max(0, self.total_degrees[u] - 1)
+            self.total_degrees[v] = max(0, self.total_degrees[v] - 1)
+            
+            del new_edges[edge]
+        
+        return new_edges
+    
+    def generate_temporal_dataset(self) -> pd.DataFrame:
+        """Generate the complete BA temporal dataset."""
+        print(f"Generating Barabási-Albert temporal graph...")
+        print(f"Nodes: {self.graph_config.num_nodes}, Timesteps: {self.temporal_config.num_timesteps}")
+        print(f"BA parameter m: {self.graph_config.ba_m}")
+        
+        # Generate initial BA graph
+        base_graph = self.generate_base_graph()
+        current_edges = self.assign_edge_signs(base_graph)
+        
+        all_data = []
+        
+        for t in range(self.temporal_config.num_timesteps):
+            timestamp = (self.temporal_config.base_time + 
+                        t * self.temporal_config.time_interval)
+            
+            for (source, target), rating in current_edges.items():
+                all_data.append({
+                    'source': source,
+                    'target': target,
+                    'rating': rating,
+                    'time': timestamp
+                })
+            
+            # Print edge counts with positive/negative breakdown
+            pos_count = sum(1 for r in current_edges.values() if r == 1)
+            neg_count = sum(1 for r in current_edges.values() if r == -1)
+            print(f"Timestep {t+1}: {len(current_edges)} edges ({pos_count}+, {neg_count}-)")
+            
+            if t < self.temporal_config.num_timesteps - 1:
+                current_edges = self.evolve_graph(current_edges, t)
+        
+        df = pd.DataFrame(all_data)
+        
+        print(f"Generated BA dataset: {len(df)} total edges")
+        print(f"Positive edges: {len(df[df['rating'] == 1])} ({len(df[df['rating'] == 1])/len(df)*100:.1f}%)")
+        print(f"Negative edges: {len(df[df['rating'] == -1])} ({len(df[df['rating'] == -1])/len(df)*100:.1f}%)")
+        
+        return df
+    
+    def save_dataset(self, df: pd.DataFrame, filename: str, compress: bool = True):
+        """Save the generated dataset to disk in CSV format."""
+        if compress and not filename.endswith('.gz'):
+            filename += '.gz'
+        
+        if filename.endswith('.gz'):
+            with gzip.open(filename, 'wt') as f:
+                df.to_csv(f, index=False, header=False)
+        else:
+            df.to_csv(filename, index=False, header=False)
+        
+        print(f"Saved dataset to: {filename}")
 
 # ============================================================================
 # CONFIGURATION FACTORY FUNCTIONS
 # ============================================================================
 
-def create_er_config(num_nodes: int = 100, num_timesteps: int = 10, 
-                     edge_prob: float = 0.005) -> Tuple[GraphConfig, TemporalConfig]:
-    """
-    Factory function to create standard Erdős-Rényi graph configurations.
-    
-    Provides sensible default parameters that work well for most use cases
-    while allowing customization of the most important parameters (nodes, timesteps, sparsity).
-    The defaults are tuned to create realistic sparse networks similar to
-    Bitcoin and other real-world signed networks.
-    
-    Args:
-        num_nodes: Number of nodes in the network
-        num_timesteps: Number of temporal snapshots to generate
-        edge_prob: Edge probability controlling network density/sparsity
-        
-    Returns:
-        Tuple of (GraphConfig, TemporalConfig) with configured parameters
-    """
+def create_ws_config(num_nodes: int = 2000, num_timesteps: int = 20, 
+                     ws_k: int = 6, ws_p: float = 0.1) -> Tuple[GraphConfig, TemporalConfig]:
+    """Factory function to create enhanced WS graph configurations."""
     graph_config = GraphConfig(
         num_nodes=num_nodes,
-        er_prob=edge_prob,
-        positive_ratio=0.85  # Bitcoin-like positive/negative ratio
+        positive_ratio=0.88,  # Higher positive ratio for realistic signed networks
+        # WS-specific parameters
+        ws_k=ws_k,
+        ws_p=ws_p,
+        # Enhanced parameters
+        num_communities=max(3, num_nodes // 100),  # More communities for small-world structure
+        community_strength=0.8
     )
     
     temporal_config = TemporalConfig(
         num_timesteps=num_timesteps,
-        edge_persistence=0.4,      # Moderate persistence for dynamic networks
-        sign_flip_prob=0.02,       # Low sign flip rate (relationships are somewhat stable)
-        new_edge_prob=0.3,         # Moderate new edge formation rate
-        edge_death_prob=0.2,       # Moderate edge removal rate
-        activity_variation=0.5     # Moderate activity fluctuations
+        edge_persistence=0.4,
+        sign_flip_prob=0.02,
+        new_edge_prob=0.3,
+        edge_death_prob=0.2,
+        activity_variation=0.5,
+        # Enhanced dynamics optimized for small-world networks
+        triadic_closure_prob=0.15,      # Higher for clustering maintenance
+        community_homophily=0.7,        # Strong within-community preference
+        sentiment_propagation=0.1,
+        node_activity_correlation=0.6,
+        degree_attachment_strength=0.3,  # Moderate for WS networks
+        temporal_clustering_strength=0.4 # Important for small-world properties
     )
     
     return graph_config, temporal_config
 
-def generate_er_dataset(filename: str = "synthetic_er.csv.gz") -> pd.DataFrame:
-    """
-    Generate a large-scale Erdős-Rényi temporal dataset with Bitcoin-like characteristics.
+def create_ba_config(num_nodes: int = 2000, num_timesteps: int = 20, 
+                     ba_m: int = 4) -> Tuple[GraphConfig, TemporalConfig]:
+    """Factory function to create BA graph configurations."""
+    graph_config = GraphConfig(
+        num_nodes=num_nodes,
+        positive_ratio=0.85,
+        # BA-specific parameters
+        ba_m=ba_m,
+        ba_seed_nodes=max(5, ba_m + 1),
+        # Enhanced parameters (less important for BA)
+        num_communities=1,  # BA networks naturally form communities
+        community_strength=0.3
+    )
     
-    Creates a substantial dataset (5000 nodes, 8 timesteps) that mimics the scale
-    and dynamics of real cryptocurrency trust networks. The parameters are specifically
-    tuned to create high temporal variation, realistic sparsity, and appropriate
-    positive/negative edge ratios found in Bitcoin transaction networks.
+    temporal_config = TemporalConfig(
+        num_timesteps=num_timesteps,
+        edge_persistence=0.5,  # Higher persistence due to preferential attachment
+        sign_flip_prob=0.015,  # Lower sign flip rate
+        new_edge_prob=0.4,     # Higher new edge rate
+        edge_death_prob=0.15,  # Lower death rate
+        activity_variation=0.6,
+        # Enhanced dynamics (tuned for BA)
+        triadic_closure_prob=0.2,   # Higher triadic closure
+        community_homophily=0.5,    # Less important for BA
+        sentiment_propagation=0.08,
+        node_activity_correlation=0.7,
+        degree_attachment_strength=0.8,  # Strong preferential attachment
+        temporal_clustering_strength=0.3
+    )
     
-    The function includes intelligent sampling to control dataset size while
-    maintaining temporal patterns and statistical properties across all timesteps.
-    
-    Args:
-        filename: Output filename for the generated dataset
-        
-    Returns:
-        Generated DataFrame containing the temporal signed graph data
-    """
-    # Configuration for Bitcoin-scale networks
-    num_nodes = 5000
-    num_timesteps = 8
-    edge_prob = 0.0008  # Very sparse to match Bitcoin's sparse transaction patterns
+    return graph_config, temporal_config
 
-    # Create base configuration
-    graph_config, temporal_config = create_er_config(num_nodes, num_timesteps, edge_prob)
+def generate_ws_dataset(filename: str = "synthetic_ws.csv.gz") -> pd.DataFrame:
+    """Generate Watts-Strogatz temporal dataset with small-world dynamics."""
+    num_nodes = 2000  # Fixed to correct value
+    num_timesteps = 20  # Fixed to correct value
+    ws_k = 6  # Each node connected to 6 nearest neighbors initially
+    ws_p = 0.1  # 10% rewiring probability for small-world properties
+
+    graph_config, temporal_config = create_ws_config(num_nodes, num_timesteps, ws_k, ws_p)
     
-    # Adjust temporal parameters to match Bitcoin's high temporal variation
-    temporal_config.edge_persistence = 0.15      # Low persistence creates high variation
-    temporal_config.new_edge_prob = 0.4          # High new edge rate for dynamic growth
-    temporal_config.edge_death_prob = 0.3        # High death rate balances growth
-    temporal_config.activity_variation = 0.8     # High variation mimics Bitcoin activity patterns
+    # Enhanced parameters for recovery patterns and better positive ratio
+    temporal_config.edge_persistence = 0.4  # Moderate persistence for dynamics
+    temporal_config.new_edge_prob = 0.3      # Not used in new logic
+    temporal_config.edge_death_prob = 0.2    # Not used in new logic
+    temporal_config.activity_variation = 0.5  # Increased for more ups and downs
+    temporal_config.triadic_closure_prob = 0.15  # Important for clustering maintenance
     
-    # Generate the dataset
-    generator = ERTemporalGraphGenerator(graph_config, temporal_config)
+    generator = WSTemporalGraphGenerator(graph_config, temporal_config)
     df = generator.generate_temporal_dataset()
     
-    # Apply intelligent sampling if dataset is too large
-    # This maintains temporal patterns while controlling computational requirements
-    total_edges = len(df)
-    target_edges = 35000  # Target size for manageable computation
+    # Use full dataset
+    print(f"Using full WS dataset: {len(df)} total edges")
     
-    if total_edges > target_edges * 1.5:
-        print(f"Sampling down from {total_edges} to ~{target_edges} edges")
-        
-        sampled_data = []
-        # Sample proportionally from each timestep to maintain temporal patterns
-        for time in sorted(df['time'].unique()):
-            timestep_df = df[df['time'] == time]
-            timestep_target = int(len(timestep_df) * target_edges / total_edges)
-            timestep_target = max(100, timestep_target)  # Ensure minimum timestep size
-            
-            if len(timestep_df) > timestep_target:
-                sampled_timestep = timestep_df.sample(n=timestep_target, random_state=42)
-            else:
-                sampled_timestep = timestep_df
-            
-            sampled_data.append(sampled_timestep)
-        
-        df = pd.concat(sampled_data, ignore_index=True)
-    
-    # Save the generated dataset
     generator.save_dataset(df, filename)
+    return df
+
+def generate_ba_dataset(filename: str = "synthetic_ba.csv.gz") -> pd.DataFrame:
+    """Generate BA temporal dataset with preferential attachment dynamics."""
+    num_nodes = 2000  # Fixed to correct value
+    num_timesteps = 20  # Fixed to correct value
+    ba_m = 4  # Increased from 3 for more connectivity
+
+    graph_config, temporal_config = create_ba_config(num_nodes, num_timesteps, ba_m)
     
-    # Print comprehensive summary statistics
-    print(f"Total edges: {len(df)}")
-    print(f"Nodes: {num_nodes}")
-    print(f"Time range: {df['time'].min()} to {df['time'].max()}")
+    # Balanced parameters for steady BA networks with controlled variation
+    temporal_config.edge_persistence = 0.65  # Moderate-high persistence
+    temporal_config.new_edge_prob = 0.5      # Not used in new logic
+    temporal_config.edge_death_prob = 0.1    # Not used in new logic
+    temporal_config.activity_variation = 0.15  # Very low variation for stability
+    temporal_config.degree_attachment_strength = 0.9  # Strong preferential attachment
     
-    # Per-timestep statistics for validation
-    for i, time in enumerate(sorted(df['time'].unique()), 1):
-        timestep_df = df[df['time'] == time]
-        pos_count = len(timestep_df[timestep_df['rating'] == 1])
-        neg_count = len(timestep_df[timestep_df['rating'] == -1])
-        print(f"Timestep {i}: {len(timestep_df)} edges ({pos_count}+, {neg_count}-)")
+    generator = BATemporalGraphGenerator(graph_config, temporal_config)
+    df = generator.generate_temporal_dataset()
     
+    # Use full dataset
+    print(f"Using full BA dataset: {len(df)} total edges")
+    
+    generator.save_dataset(df, filename)
     return df
 
 # ============================================================================
