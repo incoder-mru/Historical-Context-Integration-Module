@@ -91,7 +91,7 @@ class SE_SGformer(nn.Module):
         self.lin = nn.Linear(2 * self.node_dim, 3)  # 3-class classifier (pos/neg/none)
         self.node_out_lin = nn.Linear(self.node_dim, self.output_dim)
     
-    def create_spectral_features(self, pos_edge_index: Tensor, neg_edge_index: Tensor, 
+def create_spectral_features(self, pos_edge_index: Tensor, neg_edge_index: Tensor, 
                                num_nodes: Optional[int] = None) -> Tensor:
         """
         Generate spectral features from signed adjacency matrix using SVD.
@@ -362,17 +362,6 @@ class Temporal_SE_SGformer(nn.Module):
         self.use_adaptive_weights = args.use_adaptive_weights
         self.base_weights = args.base_weights
         
-        # Add confidence gating network
-        self.confidence_gate = nn.Sequential(
-            nn.Linear(args.node_dim * 2, args.node_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(args.node_dim // 2, args.node_dim // 4),
-            nn.ReLU(),
-            nn.Linear(args.node_dim // 4, 1),
-            nn.Sigmoid()
-        )
-        
         if self.use_adaptive_weights:
             # Learnable MLP-based combination weights that adapt per node
             self.combination_mlp = nn.Sequential(
@@ -415,31 +404,21 @@ class Temporal_SE_SGformer(nn.Module):
         # Extract historical context
         historical_context = self.history_extractor(historical_embeddings)
         
-        # Combine current and historical information with confidence gating
+        # Combine current and historical information
         if historical_context is not None:
-            # Compute confidence in historical context
-            # Concatenate current and historical embeddings for confidence assessment
-            combined_features = torch.cat([current_embeddings, historical_context], dim=1)
-            confidence_scores = self.confidence_gate(combined_features)  # [num_nodes, 1]
-            
             if self.use_adaptive_weights:
                 # Learn adaptive combination weights per node using MLP
+                combined_features = torch.cat([current_embeddings, historical_context], dim=1)
                 adaptive_weights = self.combination_mlp(combined_features)  # [num_nodes, 1]
                 
-                # Apply confidence gating to the adaptive weights
-                effective_weights = adaptive_weights * confidence_scores
-                
-                enhanced_embeddings = (1 - effective_weights) * current_embeddings + \
-                                    effective_weights * historical_context
+                enhanced_embeddings = (1 - adaptive_weights) * current_embeddings + \
+                                    adaptive_weights * historical_context
             else:
-                # Use single parameter for all nodes with confidence gating
+                # Use single parameter for all nodes
                 base_weight = torch.clamp(self.combination_weight, 0.0, 1.0)
                 
-                # Apply confidence gating to the base weight
-                effective_weights = base_weight * confidence_scores
-                
-                enhanced_embeddings = (1 - effective_weights) * current_embeddings + \
-                                    effective_weights * historical_context
+                enhanced_embeddings = (1 - base_weight) * current_embeddings + \
+                                    base_weight * historical_context
         else:
             enhanced_embeddings = current_embeddings
         
