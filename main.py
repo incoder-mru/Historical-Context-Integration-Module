@@ -232,10 +232,10 @@ def validate_arguments(args):
         raise ValueError("base_weights must be between 0.0 and 1.0")
 
 
-def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins: int = 6, 
+def compare_approaches(file_path: str, optimizer: str = 'Adam', max_norm: float = 1.0, target_timestep: int = -1, num_time_bins: int = 6, 
                       epochs: int = 50, lr: float = 0.001, weight_decay: float = 5e-4,
                       use_scheduler: bool = True, base_weights: float = 0.3, 
-                      use_adaptive_weights: bool = False, title: str = None,
+                      use_adaptive_weights: bool = False, patience: int = 20, factor = 0.8, title: str = None,
                       output_dir: str = 'results', save_models: bool = False,
                       generate_plots: bool = True, verbose: bool = False,
                       **model_kwargs):
@@ -278,6 +278,9 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
     7. Result Storage: Save metrics and configuration for analysis
     """
     
+    # Import weight analysis functions from utilities
+    from utilities import analyze_combination_weights
+
     if verbose:
         print("="*70)
         print("SE-SGFORMER: HISTORICAL CONTEXT vs BASELINE COMPARISON")
@@ -347,6 +350,8 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
     args = Args(**model_config)
     
     if verbose:
+        print(f"   Number of layers: {args.num_layers}")
+        print(f"   Number of heads: {args.num_heads}")
         print(f"   Model dimensions: {args.node_dim}")
         print(f"   Use adaptive weights: {use_adaptive_weights}")
     
@@ -374,12 +379,23 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
         )
         
         # Configure optimizer with weight decay for regularization
-        optimizer_baseline = torch.optim.Adam(baseline_model.parameters(), lr=lr, weight_decay=weight_decay)
+        if optimizer == 'Adam':
+            optimizer_baseline = torch.optim.Adam(baseline_model.parameters(), lr=lr, weight_decay=weight_decay)
+        if optimizer == 'AdamW':
+            optimizer_baseline = torch.optim.AdamW(baseline_model.parameters(), lr=lr, weight_decay=weight_decay)
+        if optimizer == 'SGD':
+            optimizer_baseline = torch.optim.SGD(
+                baseline_model.parameters(),
+                lr=lr, 
+                momentum=0.9,
+                weight_decay=weight_decay,
+                nesterov=True
+            )
         
         # Optional learning rate scheduling for better convergence
         if use_scheduler:
             scheduler_baseline = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer_baseline, mode='min', factor=0.8, patience=20, min_lr=1e-6)
+                optimizer_baseline, mode='min', factor=factor, patience=patience, min_lr=1e-6)
         
         # Training loop for baseline model
         baseline_model.train()
@@ -389,21 +405,17 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
             # Forward pass: compute node embeddings
             z = baseline_model(x_target, target_data['pos_edge_index'], target_data['neg_edge_index'])
             
-            # Compute link prediction loss
+            # Compute multi-component loss function
             loss = baseline_model.loss(z, target_data['pos_edge_index'], target_data['neg_edge_index'])
             
-            # Backward pass and optimization
+            # Standard optimization steps
             loss.backward()
-            
-            # Gradient clipping prevents training instability
-            torch.nn.utils.clip_grad_norm_(baseline_model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(baseline_model.parameters(), max_norm=max_norm)
             optimizer_baseline.step()
             
-            # Update learning rate based on loss plateau
             if use_scheduler:
                 scheduler_baseline.step(loss.item())
             
-            # Track training progress
             baseline_losses.append(loss.item())
             
             if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
@@ -412,17 +424,17 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
         # ====================================================================
         # BASELINE MODEL EVALUATION
         # ====================================================================
-        # Evaluate baseline performance across multiple metrics
+        # Evaluate baseline performance to establish comparison benchmark
         
         baseline_model.eval()
         with torch.no_grad():
             # Generate final embeddings for evaluation
             z_baseline = baseline_model(x_target, target_data['pos_edge_index'], target_data['neg_edge_index'])
             
-            # Compute standard link prediction metrics
+            # Compute standard evaluation metrics
             baseline_auc, baseline_f1 = baseline_model.test(z_baseline, target_data['pos_edge_index'], target_data['neg_edge_index'])
             
-            # Compute precision at top-100 predictions (ranking-based metric)
+            # Precision@100 for ranking evaluation
             baseline_precision_100 = calculate_precision_at_100(
                 baseline_model, x_target, target_data['pos_edge_index'], target_data['neg_edge_index']
             )
@@ -447,55 +459,59 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
         print("-" * 50)
     
     try:
-        # Initialize temporal-enhanced model
+        # Initialize temporal model with same architecture but enhanced capabilities
         temporal_model = Temporal_SE_SGformer(args).to(device)
         
-        # ====================================================================
-        # HISTORICAL CONTEXT EXTRACTION
-        # ====================================================================
-        # Extract embeddings from previous timesteps to provide temporal context
-        
+        # Process historical timesteps to generate embedding sequence
+        # This provides temporal context for the enhanced model
         historical_embeddings = []
         if historical_data:
-            if verbose:
-                print(f"   Extracting context from {len(historical_data)} previous timesteps...")
-            
-            # Process each historical timestep to extract node embeddings
-            with torch.no_grad():
-                for hist_data in historical_data:
-                    # Create features for historical timestep
-                    x_hist = temporal_model.base_model.create_spectral_features(
-                        hist_data['pos_edge_index'], hist_data['neg_edge_index'], num_nodes
-                    )
-                    
-                    # Generate embeddings that capture graph state at this timestep
+            for hist_data in historical_data:
+                # Generate spectral features for each historical timestep
+                x_hist = temporal_model.base_model.create_spectral_features(
+                    hist_data['pos_edge_index'], hist_data['neg_edge_index'], num_nodes
+                )
+                
+                # Compute embeddings using the base model (without temporal context)
+                # These will be used as historical context for the temporal model
+                with torch.no_grad():
                     z_hist = temporal_model.base_model(x_hist, hist_data['pos_edge_index'], hist_data['neg_edge_index'])
                     historical_embeddings.append(z_hist)
         
-        # Configure optimizer for temporal model
-        optimizer_temporal = torch.optim.Adam(temporal_model.parameters(), lr=lr, weight_decay=weight_decay)
+        # Configure optimizer with identical settings to baseline for fair comparison
+        if optimizer == 'Adam':
+            optimizer_temporal = torch.optim.Adam(temporal_model.parameters(), lr=lr, weight_decay=weight_decay)
+        if optimizer == 'AdamW':
+            optimizer_temporal = torch.optim.AdamW(temporal_model.parameters(), lr=lr, weight_decay=weight_decay)
+        if optimizer == 'SGD':
+            optimizer_temporal = torch.optim.SGD(
+                temporal_model.parameters(),
+                lr=lr, 
+                momentum=0.9,
+                weight_decay=weight_decay,
+                nesterov=True
+            )
         
-        # Learning rate scheduling for temporal model
+        # Optional learning rate scheduling
         if use_scheduler:
             scheduler_temporal = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer_temporal, mode='min', factor=0.8, patience=20, min_lr=1e-6)
+                optimizer_temporal, mode='min', factor=factor, patience=patience, min_lr=1e-6)
         
         # Training loop for temporal model
         temporal_model.train()
         for epoch in range(epochs):
             optimizer_temporal.zero_grad()
             
-            # Forward pass with historical context
-            # This is where temporal enhancement happens - the model combines
-            # current graph features with historical embeddings
+            # Forward pass with temporal context integration
+            # This is where the temporal enhancement takes effect
             z = temporal_model(x_target, target_data['pos_edge_index'], target_data['neg_edge_index'], historical_embeddings)
             
-            # Compute loss (same objective as baseline for fair comparison)
+            # Compute loss using same function as baseline (fair comparison)
             loss = temporal_model.loss(z, target_data['pos_edge_index'], target_data['neg_edge_index'])
             
             # Standard optimization steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(temporal_model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(temporal_model.parameters(), max_norm=max_norm)
             optimizer_temporal.step()
             
             if use_scheduler:
@@ -559,6 +575,34 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
     print(f"P@100:     {baseline_precision_100:.4f} → {temporal_precision_100:.4f} ({precision_improvement:+.4f}, {precision_improvement_pct:+.1f}%)")
     
     # ========================================================================
+    # WEIGHT ANALYSIS
+    # ========================================================================
+    # Analyze final learned combination weights
+    
+    try:
+        if use_adaptive_weights and historical_embeddings:
+            # For adaptive weights, compute average using final embeddings
+            temporal_model.eval()
+            with torch.no_grad():
+                current_embeddings = temporal_model.base_model(x_target, target_data['pos_edge_index'], target_data['neg_edge_index'])
+                historical_context = temporal_model.history_extractor(historical_embeddings)
+                weight_analysis = analyze_combination_weights(
+                    temporal_model, base_weights, current_embeddings, historical_context, verbose=True
+                )
+        else:
+            # For global weight or no historical context
+            weight_analysis = analyze_combination_weights(
+                temporal_model, base_weights, verbose=True
+            )
+        
+        avg_weight = weight_analysis.get('avg_weight', 0.0)
+        
+    except Exception as e:
+        print(f"\n Weight analysis failed: {e}")
+        avg_weight = 0.0
+        weight_analysis = {'error': str(e)}
+    
+    # ========================================================================
     # PHASE 6: VISUALIZATION GENERATION
     # ========================================================================
     # Create comprehensive visualizations for result analysis and presentation
@@ -605,28 +649,20 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
     # ========================================================================
     # Compile comprehensive results dictionary for analysis and reproducibility
     
-    # Compile all experimental results into structured format
     results = {
-        # Experimental setup information
-        'target_timestep': target_data['timestep'],
-        'num_historical': len(historical_data),
-        'num_nodes': num_nodes,
-        
-        # Baseline model performance
         'baseline': {
             'auc': baseline_auc,
             'f1': baseline_f1,
-            'precision_at_100': baseline_precision_100
+            'precision_100': baseline_precision_100,
+            'loss_history': baseline_losses
         },
-        
-        # Temporal model performance
         'temporal': {
             'auc': temporal_auc,
             'f1': temporal_f1,
-            'precision_at_100': temporal_precision_100
+            'precision_100': temporal_precision_100,
+            'loss_history': temporal_losses,
+            'avg_combination_weight': avg_weight  # Weight analysis result
         },
-        
-        # Improvement analysis
         'improvement': {
             'auc': auc_improvement,
             'f1': f1_improvement,
@@ -635,9 +671,18 @@ def compare_approaches(file_path: str, target_timestep: int = -1, num_time_bins:
             'f1_pct': f1_improvement_pct,
             'precision_100_pct': precision_improvement_pct
         },
-        
-        # Configuration for reproducibility
-        'config': vars(args),
+        'config': {
+            'epochs': epochs,
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'base_weights': base_weights,
+            'use_adaptive_weights': use_adaptive_weights,
+            'num_time_bins': num_time_bins,
+            'target_timestep': target_timestep,
+            'num_nodes': num_nodes,
+            'num_historical_timesteps': len(historical_data)
+        },
+        'weight_analysis': weight_analysis  # Full weight analysis results
     }
     
     # Save results to JSON file for later analysis
