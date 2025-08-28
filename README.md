@@ -1,6 +1,6 @@
-# Temporal-Enhanced SE-SGformer
+# Historical Context Integration Module (HCIM)
 
-A temporally-weighted extension of the SE-SGformer for signed link prediction in dynamic networks.
+A temporally-weighted extension of the static signed graph neural networks for signed link prediction in dynamic networks.
 
 ## Overview
 
